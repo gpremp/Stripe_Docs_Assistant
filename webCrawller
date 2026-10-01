@@ -1,0 +1,111 @@
+"""Fetch one Stripe documentation page and save its Markdown locally."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import os
+import re
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+
+
+DEFAULT_URL = "https://docs.stripe.com/payments"
+OUTPUT_DIR = Path("data/stripe_docs")
+MAX_ATTEMPTS = 3
+
+
+def validate_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "docs.stripe.com":
+        raise ValueError("URL must use https://docs.stripe.com")
+    if parsed.username or parsed.password:
+        raise ValueError("Credentials are not allowed in the URL")
+    return url
+
+
+def output_path(url: str) -> Path:
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", "-".join(parts)).strip("-") or "index"
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+    return OUTPUT_DIR / f"{slug[:100]}-{digest}.md"
+
+
+def markdown_text(markdown: object) -> str:
+    if isinstance(markdown, str):
+        return markdown
+    raw_markdown = getattr(markdown, "raw_markdown", None)
+    if isinstance(raw_markdown, str):
+        return raw_markdown
+    raise ValueError("Crawl4AI returned no usable Markdown")
+
+
+def save_markdown(path: Path, url: str, content: str) -> None:
+    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    document = f"<!-- source: {url} | fetched_at: {fetched_at} -->\n\n{content.rstrip()}\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(document)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+async def crawl_page(url: str) -> Path:
+    config = CrawlerRunConfig(page_timeout=60_000)
+    path = output_path(url)
+
+    async with AsyncWebCrawler() as crawler:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                result = await crawler.arun(url=url, config=config)
+                if not result.success:
+                    raise RuntimeError(result.error_message or "Crawl failed")
+
+                content = markdown_text(result.markdown).strip()
+                if not content:
+                    raise RuntimeError("Crawl succeeded but returned empty Markdown")
+
+                save_markdown(path, url, content)
+                return path
+            except Exception as error:
+                if attempt == MAX_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Could not crawl {url} after {MAX_ATTEMPTS} attempts: {error}"
+                    ) from error
+                await asyncio.sleep(2 ** (attempt - 1))
+
+    raise RuntimeError("Crawl ended without producing a document")
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("url", nargs="?", default=DEFAULT_URL)
+    args = parser.parse_args()
+
+    try:
+        url = validate_url(args.url)
+        path = await crawl_page(url)
+    except (ValueError, RuntimeError) as error:
+        parser.error(str(error))
+
+    print(f"Saved Markdown to {path}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
